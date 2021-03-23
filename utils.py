@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Utility classes and functions for manipulation of data, generating and
-training models, and running classification tests.
+training models, and running classification/translation tests.
 
 @author: Kevin Indrebo
 """
@@ -14,7 +14,11 @@ import torch.optim as optim
 import torch
 import torch.nn as nn
 from nltk import word_tokenize
-
+from tqdm.notebook import tqdm as tqdm_notebook
+from PyTorchNLPBook_utils import NMTVectorizer,make_train_state, \
+    update_train_state,generate_nmt_batches,sequence_loss,compute_accuracy, \
+    NMTDataset
+from models import NMTModelWithMLTM
 
 
 class TextDataset(Dataset):
@@ -356,6 +360,90 @@ class BinaryMLTMVectorizer(object):
         return self.nl.isin(lv_active).values
 
 
+class NMTVectorizerWithMLTM(NMTVectorizer):
+    """
+    Extends NMTVectorizer by adding support for another data vector from the
+    WordEmbedMLTM.
+    """
+    
+    def __init__(self, source_vocab, target_vocab, max_source_length, 
+                 max_target_length):
+        """
+        
+
+        Parameters
+        ----------
+        source_vocab : SequenceVocabulary
+            Maps source words to integers.
+        target_vocab : SequenceVocabulary
+            Maps target words to integers.
+        max_source_length : int
+            The longest sequence in the source dataset.
+        max_target_length : int
+            The longest sequence in the target dataset.
+        mltm_vectorizer : BinaryMLTMVectorizer
+            Vectorizes English text by latent variables.
+        """
+        
+        super().__init__(source_vocab,target_vocab,max_source_length,
+                         max_target_length)
+        self.mltm_vectorizer = None
+        
+    def set_mltm_vectorizer(self,mltm_vectorizer):
+        self.mltm_vectorizer = mltm_vectorizer
+
+    def vectorize(self, source_text, target_text, use_dataset_max_lengths=True):
+        """
+        Calls super mehtod and adds a MLTM vector to the data dict.
+
+        Parameters
+        ----------
+        source_text : str
+            Text from the source language.
+        target_text : str
+            Text from the source language.
+        use_dataset_max_lengths : bool, optional
+            Whether to use the global max vector lengths. The default is True.
+
+        Returns
+        -------
+        data : dict
+            Vectorized data point as a dict.
+        """
+       
+        data = super().vectorize(source_text, target_text, use_dataset_max_lengths)
+        
+        mltm_x_vector = self.mltm_vectorizer.vectorize(source_text.lower())
+        mltm_x_vector = mltm_x_vector.astype(np.float32)
+        
+        data["x_source_mltm_vector"] = mltm_x_vector
+        return data
+
+
+class NMTDatasetWithMLTM(NMTDataset):
+    
+    def __getitem__(self, index):
+        """the primary entry point method for PyTorch datasets
+        
+        Args:
+            index (int): the index to the data point 
+        Returns:
+            a dictionary holding the data point: (x_data, y_target, class_index)
+        """
+        
+        row = self._target_df.iloc[index]
+
+        vector_dict = self._vectorizer.vectorize(row.source_language, row.target_language)
+
+        return {"x_source": vector_dict["source_vector"], 
+                "x_target": vector_dict["target_x_vector"],
+                "y_target": vector_dict["target_y_vector"], 
+                "x_source_length": vector_dict["source_length"],
+                "x_source_mltm_vector": vector_dict["x_source_mltm_vector"]}
+
+
+
+
 class MLPFactory(object):
     """
     Factory for generating MLP's with user-defined architecture.
@@ -467,6 +555,291 @@ class MLPFactory(object):
         
         if dropout is not None:
             components.append(nn.Dropout(dropout))
+
+
+class NMTModelTrainer(object):
+    """
+    Trains an NMTModel with user-defined parameters. Adapted from Rao and
+    McMahan (see PyTorchNLPBook_util.py).
+    """
+    
+    def __init__(self,model,dataset,args):
+        """
+        Sets model, data, and training algo parameters.
+
+        Parameters
+        ----------
+        model : NMTModel
+            The neural machine translation model.
+        dataset : NMTDataset
+            Translation text data.
+        args : Namespace
+            Training parameters.
+        """
+        
+        self.args = args
+        self.dataset = dataset
+        self.model = model.to(args.device)
+        
+        self.optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer=self.optimizer,
+                                                   mode='min', factor=0.5,
+                                                   patience=1)
+        
+        vectorizer = dataset.get_vectorizer()
+        self.mask_index = vectorizer.target_vocab.mask_index
+        self.train_state = make_train_state(args)
+        
+        self.epoch_bar = tqdm_notebook(desc='training routine', 
+                                  total=args.num_epochs,
+                                  position=0)
+        
+        self.dataset.set_split('train')
+        self.train_bar = tqdm_notebook(desc='split=train',
+                                  total=dataset.get_num_batches(args.batch_size), 
+                                  position=1, 
+                                  leave=True)
+        self.dataset.set_split('val')
+        self.val_bar = tqdm_notebook(desc='split=val',
+                                total=dataset.get_num_batches(args.batch_size), 
+                                position=1, 
+                                leave=True)
+
+    def train(self):
+        """
+        Runs the training algorithm.
+
+        Returns
+        -------
+        None.
+        """
+        
+        args = self.args
+        model = self.model
+        dataset = self.dataset
+        train_state = self.train_state
+        optimizer = self.optimizer
+        scheduler = self.scheduler
+        train_bar = self.train_bar
+        val_bar = self.val_bar
+        epoch_bar = self.epoch_bar
+        
+        for epoch_index in range(args.num_epochs):
+            train_state['epoch_index'] = epoch_index
+    
+            # Iterate over training dataset
+    
+            running_loss,running_acc = self.train_loop(epoch_index, args, 
+                                                       model, dataset, 
+                                                       optimizer, train_bar)
+    
+            train_state['train_loss'].append(running_loss)
+            train_state['train_acc'].append(running_acc)
+            
+            running_loss,running_acc = self.val_loop(epoch_index, args, model, 
+                                                     dataset, optimizer, val_bar)
+            
+            
+            train_state['val_loss'].append(running_loss)
+            train_state['val_acc'].append(running_acc)
+            
+            print("Epoch "+str(epoch_index+1)+": Running loss="+str(running_loss)+", Running Acc="+str(running_acc))
+    
+            train_state = update_train_state(args=args, model=model, 
+                                             train_state=train_state)
+    
+            scheduler.step(train_state['val_loss'][-1])
+    
+            if train_state['stop_early']:
+                break
+                
+            train_bar.n = 0
+            val_bar.n = 0
+            epoch_bar.set_postfix(best_val=train_state['early_stopping_best_val'] )
+            epoch_bar.update()
+        
+        state_dict = torch.load(train_state['model_filename'])
+        model.load_state_dict(state_dict)
+        return model
+        
+    def train_loop(self,epoch_index,args,model,dataset,optimizer,train_bar):
+        """
+        Runs the training for a single epoch.
+
+        Parameters
+        ----------
+        epoch_index : int
+            Index of the epoch.
+        args : Namespace
+            Training parameters.
+        model : NMTModel
+            Translation model to train.
+        dataset : Dataset
+            Torch dataset.
+        optimizer : Optimizer
+            The torch optimizer object.
+        train_bar : tqdm_notebook
+            Notebook for recording training stats.
+
+        Returns
+        -------
+        running_loss : float
+            Average loss for all training examples.
+        running_acc : float
+            Average accuracy on training examples.
+        """
+        
+        dataset.set_split('train')
+        batch_generator = generate_nmt_batches(dataset, 
+                                               batch_size=args.batch_size, 
+                                               device=args.device)
+        
+        running_loss = 0.0
+        running_acc = 0.0
+        model.train()
+
+        for batch_index, batch_dict in enumerate(batch_generator):
+            # the training routine is these 5 steps:
+
+            # --------------------------------------    
+            # step 1. zero the gradients
+            optimizer.zero_grad()
+
+            # step 2. compute the output
+            if isinstance(model,NMTModelWithMLTM):
+                y_pred = model(batch_dict['x_source'], 
+                           batch_dict['x_source_mltm_vector'],
+                           batch_dict['x_source_length'], 
+                           batch_dict['x_target'])
+            else:
+                y_pred = model(batch_dict['x_source'], 
+                           batch_dict['x_source_length'], 
+                           batch_dict['x_target'])
+
+            # step 3. compute the loss
+            loss = sequence_loss(y_pred, batch_dict['y_target'], self.mask_index)
+
+            # step 4. use loss to produce gradients
+            loss.backward()
+
+            # step 5. use optimizer to take gradient step
+            optimizer.step()
+            # -----------------------------------------
+            # compute the running loss and running accuracy
+            running_loss += (loss.item() - running_loss) / (batch_index + 1)
+
+            acc_t = compute_accuracy(y_pred, batch_dict['y_target'], self.mask_index)
+            running_acc += (acc_t - running_acc) / (batch_index + 1)
+            
+            # update bar
+            train_bar.set_postfix(loss=running_loss, acc=running_acc, 
+                            epoch=epoch_index)
+            train_bar.update()
+        
+        return running_loss,running_acc
+
+    def val_loop(self,epoch_index,args,model,dataset,optimizer,val_bar):
+        """
+        Evaluates the model on the validation set.
+
+        Parameters
+        ----------
+        epoch_index : int
+            Index of the epoch.
+        args : Namespace
+            Training parameters.
+        model : NMTModel
+            Translation model to train.
+        dataset : Dataset
+            Torch dataset.
+        optimizer : Optimizer
+            The torch optimizer object.
+        val_bar : tqdm_notebook
+            Notebook for recording validation stats.
+
+        Returns
+        -------
+        running_loss : float
+            Average loss for all validation examples.
+        running_acc : float
+            Average accuracy on validation examples.
+        """
+        
+        dataset.set_split('val')
+        batch_generator = generate_nmt_batches(dataset, 
+                                               batch_size=args.batch_size, 
+                                               device=args.device)
+        running_loss = 0.0
+        running_acc = 0.0
+        model.eval()
+        
+        for batch_index, batch_dict in enumerate(batch_generator):
+            # step 1. compute the output
+            if isinstance(model,NMTModelWithMLTM):
+                y_pred = model(batch_dict['x_source'], 
+                           batch_dict['x_source_mltm_vector'],
+                           batch_dict['x_source_length'], 
+                           batch_dict['x_target'])
+            else:
+                y_pred = model(batch_dict['x_source'], 
+                           batch_dict['x_source_length'], 
+                           batch_dict['x_target'])
+
+            # step 2. compute the loss
+            loss = sequence_loss(y_pred, batch_dict['y_target'], self.mask_index)
+            
+            # -----------------------------------------
+            # compute the running loss and running accuracy
+            running_loss += (loss.item() - running_loss) / (batch_index + 1)
+
+            acc_t = compute_accuracy(y_pred, batch_dict['y_target'], self.mask_index)
+            running_acc += (acc_t - running_acc) / (batch_index + 1)
+            
+            # update bar
+            val_bar.set_postfix(loss=running_loss, acc=running_acc, 
+                            epoch=epoch_index)
+            val_bar.update()
+        
+        return running_loss,running_acc
+
+    def test(self):
+        """
+        Tests the model on the test set, measuring accuracy.
+
+        Returns
+        -------
+        float
+            Total accuracy of the model on the test set.
+        """
+        
+        args = self.args
+        model = self.model
+        dataset = self.dataset
+        
+        dataset.set_split('test')
+        batch_generator = generate_nmt_batches(dataset, 
+                                               batch_size=len(dataset), 
+                                               device=args.device)
+
+        acc_sum = 0.0
+        model.eval()
+        
+        for batch_index, batch_dict in enumerate(batch_generator):
+            # step 1. compute the output
+            if isinstance(model,NMTModelWithMLTM):
+                y_pred = model(batch_dict['x_source'], 
+                           batch_dict['x_source_mltm_vector'],
+                           batch_dict['x_source_length'], 
+                           batch_dict['x_target'])
+            else:
+                y_pred = model(batch_dict['x_source'], 
+                           batch_dict['x_source_length'], 
+                           batch_dict['x_target'])
+
+            acc_t = compute_accuracy(y_pred, batch_dict['y_target'], self.mask_index)
+            acc_sum += acc_t
+        
+        return acc_sum / (batch_index+1)
 
 
 class SimpleModelTrainer(object):

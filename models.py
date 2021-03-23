@@ -15,6 +15,7 @@ from torch.nn import functional as F
 import torch
 import torch.nn as nn
 from collections import Counter
+from PyTorchNLPBook_utils import NMTEncoder,verbose_attention
 
 
 class WordEmbedMLTM(object):
@@ -184,7 +185,7 @@ class WordEmbedMLTM(object):
             all_words_ = all_words_[all_mask]
         
         return all_words_
-        
+    
     def cluster(self,embed_df):
         """
         Clusters the word embeddings using AgglomerativeClustering.
@@ -204,6 +205,7 @@ class WordEmbedMLTM(object):
         model = AgglomerativeClustering(distance_threshold=0, n_clusters=None)
         data = embed_df.values
         model = model.fit(data)
+        
         return model
 
     def prune_tree(self,min_leaf_descendants):
@@ -421,6 +423,219 @@ class NaiveBayesClassifier(object):
         log_probs += self.priors
         return log_probs
 
+
+class NMTModelWithMLTM(nn.Module):
+    """
+    Modification of NMTModel which injects a MLTM feature vector into
+    the context vector of the NMTDecoder module.
+    """
+    
+    def __init__(self, source_vocab_size, source_embedding_size, 
+                 target_vocab_size, target_embedding_size, encoding_size, 
+                 target_bos_index, mltm_length, mltm_dropout=None):
+        """
+        Parameters
+        ----------
+        source_vocab_size : int
+            Number of unique words in source language.
+        source_embedding_size : int
+            Size of the source embedding vectors.
+        target_vocab_size : int
+            Number of unique words in target language.
+        target_embedding_size : int
+            Size of the target embedding vectors.
+        encoding_size : int
+            The size of the encoder RNN.
+        target_bos_index : int
+            Index for BEGIN-OF-SEQUENCE token.
+        mltm_length : int
+            Length of input MLTM feature vector.
+        mltm_dropout : float, optional
+            Dropout rate for output MLTM layer. The default is None.
+
+        Returns
+        -------
+        None.
+        """
+        
+        super().__init__()
+        self.encoder = NMTEncoder(num_embeddings=source_vocab_size, 
+                                  embedding_size=source_embedding_size,
+                                  rnn_hidden_size=encoding_size)
+        decoding_size = encoding_size * 2
+        self.decoder = NMTDecoderWithMLTM(num_embeddings=target_vocab_size, 
+                                  embedding_size=target_embedding_size, 
+                                  rnn_hidden_size=decoding_size,
+                                  bos_index=target_bos_index,
+                                  mltm_length=mltm_length,
+                                  mltm_dropout=mltm_dropout)
+        
+    def forward(self, x_source, x_mltm, x_source_lengths, target_sequence):
+        """
+        Forward pass of the model.
+
+        Parameters
+        ----------
+        x_source : torch.Tensor
+             The source text data tensor. x_source.shape should be 
+             (batch, vectorizer.max_source_length)
+        x_mltm : torch.Tensor
+            The last hidden state in the NMTEncoder.
+        x_source_lengths : torch.Tensor
+            The length of the sequences in x_source.
+        target_sequence : torch.Tensor
+            The target text data tensor.
+
+        Returns
+        -------
+        decoded_states : torch.Tensor
+            Prediction vectors at each output step.
+        """
+
+        encoder_state, final_hidden_states = self.encoder(x_source, x_source_lengths)
+        decoded_states = self.decoder(encoder_state=encoder_state, 
+                                      initial_hidden_state=final_hidden_states, 
+                                      target_sequence=target_sequence,
+                                      x_mltm=x_mltm)
+        return decoded_states
+
+
+class NMTDecoderWithMLTM(nn.Module):
+    """
+    Modification of NMTDecoder which injects a MLTM feature vector into
+    the context vector.
+    """
+    
+    def __init__(self, num_embeddings, embedding_size, rnn_hidden_size, bos_index,
+                 mltm_length, mltm_dropout=None):
+        """
+        Parameters
+        ----------
+        num_embeddings : int
+            Number of embeddings is also the number of unique words in target 
+            vocabulary.
+        embedding_size : int
+            The embedding vector size.
+        rnn_hidden_size : int
+            Size of the hidden rnn state.
+        bos_index : int
+            Begin-of-sequence index.
+        mltm_length : int
+            Length of input MLTM feature vector.
+        mltm_dropout : float, optional
+            Dropout rate for MLTM output layer. The default is None.
+
+        Returns
+        -------
+        None.
+        """
+        
+        super().__init__()
+        self.mltm_mlp = nn.Linear(mltm_length,rnn_hidden_size)
+        if mltm_dropout is not None:
+            self.mltm_dropout = nn.Dropout(mltm_dropout)
+        else:
+            self.mltm_dropout = None
+        self._rnn_hidden_size = rnn_hidden_size
+        self.target_embedding = nn.Embedding(num_embeddings=num_embeddings, 
+                                             embedding_dim=embedding_size, 
+                                             padding_idx=0)
+        self.gru_cell = nn.GRUCell(embedding_size + rnn_hidden_size*2, 
+                                   rnn_hidden_size)
+        self.hidden_map = nn.Linear(rnn_hidden_size, rnn_hidden_size)
+        self.classifier = nn.Linear(rnn_hidden_size * 3, num_embeddings)
+        self.bos_index = bos_index
+    
+    def _init_indices(self, batch_size):
+        """ return the BEGIN-OF-SEQUENCE index vector """
+        return torch.ones(batch_size, dtype=torch.int64) * self.bos_index
+    
+    def _init_context_vectors(self, batch_size):
+        """ return a zeros vector for initializing the context """
+        return torch.zeros(batch_size, self._rnn_hidden_size)
+        
+    def forward(self, encoder_state, x_mltm, initial_hidden_state, target_sequence):
+        """
+        Forward pass of the model.
+
+        Parameters
+        ----------
+        encoder_state : torch.Tensor
+            The output of the NMTEncoder.
+        x_mltm : torch.Tensor
+            The last hidden state in the NMTEncoder.
+        initial_hidden_state : torch.Tensor
+            The target text data tensor.
+        target_sequence : torch.Tensor
+            Prediction vectors at each output step.
+
+        Returns
+        -------
+        output_vectors : torch.Tensor
+            Output prediction  vector.
+        """
+
+        #apply a linear transformation to project MLTM features to rnn_hidden_size
+        y_mltm = self.mltm_mlp(x_mltm)
+        if self.mltm_dropout is not None:
+            y_mltm = self.mltm_dropout(y_mltm)
+        
+        # We are making an assumption there: The batch is on first
+        # The input is (Batch, Seq)
+        # We want to iterate over sequence so we permute it to (S, B)
+        target_sequence = target_sequence.permute(1, 0)
+        output_sequence_size = target_sequence.size(0)
+
+        # use the provided encoder hidden state as the initial hidden state
+        h_t = self.hidden_map(initial_hidden_state)
+
+        batch_size = encoder_state.size(0)
+        # initialize context vectors to zeros
+        context_vectors = self._init_context_vectors(batch_size)
+        #add the projected latent tree variables to the context vector
+        context_vectors = torch.cat([context_vectors,y_mltm],dim=1)
+        # initialize first y_t word as BOS
+        y_t_index = self._init_indices(batch_size)
+        
+        h_t = h_t.to(encoder_state.device)
+        y_t_index = y_t_index.to(encoder_state.device)
+        context_vectors = context_vectors.to(encoder_state.device)
+
+        output_vectors = []
+        self._cached_p_attn = []
+        self._cached_ht = []
+        self._cached_decoder_state = encoder_state.cpu().detach().numpy()
+        
+        for i in range(output_sequence_size):
+            y_t_index = target_sequence[i]
+                
+            # Step 1: Embed word and concat with previous context
+            y_input_vector = self.target_embedding(y_t_index)
+            rnn_input = torch.cat([y_input_vector, context_vectors], dim=1)
+            
+            # Step 2: Make a GRU step, getting a new hidden vector
+            h_t = self.gru_cell(rnn_input, h_t)
+            self._cached_ht.append(h_t.cpu().detach().numpy())
+            
+            # Step 3: Use the current hidden to attend to the encoder state
+            context_vectors, p_attn, _ = verbose_attention(encoder_state_vectors=encoder_state, 
+                                                           query_vector=h_t)
+            
+            #add the projected latent tree variables to the context vector
+            context_vectors = torch.cat([context_vectors,y_mltm],dim=1)
+            # auxillary: cache the attention probabilities for visualization
+            self._cached_p_attn.append(p_attn.cpu().detach().numpy())
+            
+            # Step 4: Use the current hidden and context vectors to make a prediction to the next word
+            prediction_vector = torch.cat((context_vectors, h_t), dim=1)
+            score_for_y_t_index = self.classifier(F.dropout(prediction_vector, 0.3))
+            
+            # auxillary: collect the prediction scores
+            output_vectors.append(score_for_y_t_index)
+            
+        output_vectors = torch.stack(output_vectors).permute(1, 0, 2)
+        
+        return output_vectors
 
 
 
