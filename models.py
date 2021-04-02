@@ -15,7 +15,7 @@ from torch.nn import functional as F
 import torch
 import torch.nn as nn
 from collections import Counter
-from PyTorchNLPBook_utils import NMTEncoder,verbose_attention
+from PyTorchNLPBook_utils import NMTModel,NMTEncoder,verbose_attention
 
 
 class WordEmbedMLTM(object):
@@ -424,6 +424,85 @@ class NaiveBayesClassifier(object):
         return log_probs
 
 
+class NMTModelPretrained(NMTModel):
+    """ 
+    Extends the NMTModel to allow for pretrained source embeddings.
+    """
+    
+    def __init__(self, source_vocab_size, source_embedding_size, 
+                 target_vocab_size, target_embedding_size, encoding_size, 
+                 target_bos_index, pretrained_source_embeddings=None):
+        """
+        Parameters
+        ----------
+        source_vocab_size : int
+            Number of unique words in source language.
+        source_embedding_size : int
+            Size of the source embedding vectors.
+        target_vocab_size : int
+            Number of unique words in target language.
+        target_embedding_size : int
+            Size of the target embedding vectors.
+        encoding_size : int
+            The size of the encoder RNN.
+        target_bos_index : int
+            Index for BEGIN-OF-SEQUENCE token.
+        pretrained_source_embeddings : torch.Tensor, optional
+            Pretrained source embedding weights. The default is None.
+
+        Returns
+        -------
+        None.
+        """
+        super().__init__(source_vocab_size, source_embedding_size, 
+                 target_vocab_size, target_embedding_size, encoding_size, 
+                 target_bos_index)
+        
+        if pretrained_source_embeddings is not None:
+            self.encoder = NMTEncoderPretrained(num_embeddings=source_vocab_size, 
+                                  embedding_size=source_embedding_size,
+                                  rnn_hidden_size=encoding_size,
+                                  pretrained_embeddings=pretrained_source_embeddings)
+        # decoding_size = encoding_size * 2
+        # self.decoder = NMTDecoder(num_embeddings=target_vocab_size, 
+        #                           embedding_size=target_embedding_size, 
+        #                           rnn_hidden_size=decoding_size,
+        #                           bos_index=target_bos_index)
+
+
+class NMTEncoderPretrained(NMTEncoder):
+    """
+    Extends NMTEncoder to allow for pretrained embeddings to be injected.
+    """
+    
+    def __init__(self, num_embeddings, embedding_size, rnn_hidden_size, 
+                 pretrained_embeddings=None):
+        """
+        Parameters
+        ----------
+        num_embeddings : int
+            Number of embeddings is the size of source vocabulary.
+        embedding_size : int
+            Size of the embedding vectors.
+        rnn_hidden_size : int
+            Size of the RNN hidden state vectors.
+        pretrained_embeddings : Torch.Tensor, optional
+            Pretrained embeddings. The default value is None.
+
+        Returns
+        -------
+        None.
+        """
+        
+        super().__init__(num_embeddings, embedding_size, rnn_hidden_size)
+        
+        if pretrained_embeddings is not None:
+            self.source_embedding = nn.Embedding.from_pretrained(pretrained_embeddings,
+                                                                 freeze=False,
+                                                                 padding_idx=0)
+        
+    
+
 class NMTModelWithMLTM(nn.Module):
     """
     Modification of NMTModel which injects a MLTM feature vector into
@@ -432,7 +511,8 @@ class NMTModelWithMLTM(nn.Module):
     
     def __init__(self, source_vocab_size, source_embedding_size, 
                  target_vocab_size, target_embedding_size, encoding_size, 
-                 target_bos_index, mltm_length, mltm_dropout=None):
+                 target_bos_index, mltm_length, mltm_dropout=None,
+                 pretrained_source_embeddings=None):
         """
         Parameters
         ----------
@@ -452,16 +532,19 @@ class NMTModelWithMLTM(nn.Module):
             Length of input MLTM feature vector.
         mltm_dropout : float, optional
             Dropout rate for output MLTM layer. The default is None.
-
+        pretrained_source_embeddings : torch.Tensor, optional
+            Pretrained source embedding weights. The default is None.
+            
         Returns
         -------
         None.
         """
         
         super().__init__()
-        self.encoder = NMTEncoder(num_embeddings=source_vocab_size, 
+        self.encoder = NMTEncoderPretrained(num_embeddings=source_vocab_size, 
                                   embedding_size=source_embedding_size,
-                                  rnn_hidden_size=encoding_size)
+                                  rnn_hidden_size=encoding_size,
+                                  pretrained_embeddings=pretrained_source_embeddings)
         decoding_size = encoding_size * 2
         self.decoder = NMTDecoderWithMLTM(num_embeddings=target_vocab_size, 
                                   embedding_size=target_embedding_size, 
@@ -592,8 +675,7 @@ class NMTDecoderWithMLTM(nn.Module):
         batch_size = encoder_state.size(0)
         # initialize context vectors to zeros
         context_vectors = self._init_context_vectors(batch_size)
-        #add the projected latent tree variables to the context vector
-        context_vectors = torch.cat([context_vectors,y_mltm],dim=1)
+
         # initialize first y_t word as BOS
         y_t_index = self._init_indices(batch_size)
         
@@ -601,6 +683,9 @@ class NMTDecoderWithMLTM(nn.Module):
         y_t_index = y_t_index.to(encoder_state.device)
         context_vectors = context_vectors.to(encoder_state.device)
 
+        #add the projected latent tree variables to the context vector
+        context_vectors = torch.cat([context_vectors,y_mltm],dim=1)
+        
         output_vectors = []
         self._cached_p_attn = []
         self._cached_ht = []

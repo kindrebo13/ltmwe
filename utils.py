@@ -17,7 +17,7 @@ from nltk import word_tokenize
 from tqdm.notebook import tqdm as tqdm_notebook
 from PyTorchNLPBook_utils import NMTVectorizer,make_train_state, \
     update_train_state,generate_nmt_batches,sequence_loss,compute_accuracy, \
-    NMTDataset
+    NMTDataset,NMTSampler
 from models import NMTModelWithMLTM
 
 
@@ -643,13 +643,14 @@ class NMTModelTrainer(object):
             train_state['val_loss'].append(running_loss)
             train_state['val_acc'].append(running_acc)
             
-            print("Epoch "+str(epoch_index+1)+": Running loss="+str(running_loss)+", Running Acc="+str(running_acc))
-    
+            print("Epoch "+str(epoch_index+1)+": Running loss="+ \
+                          str(running_loss)+", Running Acc="+str(running_acc))
+                
             train_state = update_train_state(args=args, model=model, 
                                              train_state=train_state)
     
             scheduler.step(train_state['val_loss'][-1])
-    
+            
             if train_state['stop_early']:
                 break
                 
@@ -976,6 +977,58 @@ class SimpleModelTrainer(object):
         return train_state['best_model'],train_state
 
 
+class NMTSamplerWithMLTM(NMTSampler):
+    """
+    Extends the NMTSampler class to handle NMTModelWithMLTM models.
+    """
+    
+    def __init__(self, vectorizer, model):
+        """
+        Parameters
+        ----------
+        vectorizer : object
+            Vectorizes text data.
+        model : NMTModel
+            Trained neural machined translation model.
+
+        Returns
+        -------
+        None.
+        """
+        
+        super().__init__(vectorizer,model)
+    
+    def apply_to_batch(self, batch_dict):
+        """
+        Generates predictions and attentions for a batch.
+
+        Parameters
+        ----------
+        batch_dict : dict
+            Map of input data Tensors.
+
+        Returns
+        -------
+        None.
+        """
+        
+        self._last_batch = batch_dict
+        
+        if isinstance(self.model,NMTModelWithMLTM):
+            y_pred = self.model(x_source=batch_dict['x_source'], 
+                                x_mltm=batch_dict['x_source_mltm_vector'],
+                            x_source_lengths=batch_dict['x_source_length'], 
+                            target_sequence=batch_dict['x_target'])
+        else:
+            y_pred = self.model(x_source=batch_dict['x_source'], 
+                            x_source_lengths=batch_dict['x_source_length'], 
+                            target_sequence=batch_dict['x_target'])
+        self._last_batch['y_pred'] = y_pred
+        
+        attention_batched = np.stack(self.model.decoder._cached_p_attn).transpose(1, 0, 2)
+        self._last_batch['attention'] = attention_batched
+
+
 def split_data(text_df,splits=None,rand_perm=True):
     """
     Splits a DataFrame into 3 distinct DataFrames based on the given percentages
@@ -1067,27 +1120,39 @@ def classify(dataset,classifier,feat_mask=None):
     return acc,y_test,pred
 
 
-def filter_nmt_file(filename):
+def filter_nmt_file(filename,filter_fn=None):
     """
-    Reads a English -> French text file and filters the lines to include
-    only those that start with:
-        'i am'
-        'he is'
-        'she is'
-        'they are'
-        'you are'
-        'we are'
+    Reads a English -> French text file and filters the lines based on the
+    given filter_fn. If filter_fn is None, the default filter will be
+    used: 
+        include only those english sentences that start with:
+            'i am'
+            'he is'
+            'she is'
+            'they are'
+            'you are'
+            'we are'
 
     Parameters
     ----------
     filename : str
         Name of text file.
+    filter_fn : function
+        Determines which sentence pairs will be included
 
     Returns
     -------
     filtered_lines : list
         List of strings of English -> French text.
     """
+    
+    if filter_fn is None:
+        filter_fn = lambda en : en.lower().startswith('i am') or \
+            en.lower().startswith('he is') or \
+            en.lower().startswith('she is') or \
+            en.lower().startswith('they are') or \
+            en.lower().startswith('you are') or \
+            en.lower().startswith('we are')
     
     filtered_lines = []
     with open(filename) as file:
@@ -1096,13 +1161,8 @@ def filter_nmt_file(filename):
             text = line.split('\t')
             en = text[0]
             fra = text[1]
-            if en.lower().startswith('i am') or en.lower().startswith('he is') \
-                or en.lower().startswith('she is') or \
-                en.lower().startswith('they are') or \
-                en.lower().startswith('you are') or \
-                en.lower().startswith('we are'):
-                
-                filtered_lines.append(en + '\t' + fra)
+            if filter_fn(en):
+                filtered_lines.append(en.lower() + '\t' + fra.lower())
 
     return filtered_lines
 
@@ -1174,5 +1234,80 @@ def process_glove_data(filename):
     embed_df.index = embed_df.index.str.lower()
     
     return embed_df
+
+def get_pretrained_embeddings(source_vocab,embed_df):
+    """
+    Creates a Tensor for use as an Embedding initialization from the source
+    vocabulary and pre-defined word embeddings.
+
+    Parameters
+    ----------
+    source_vocab : Vocabulary
+        Vocabulary with lookups for source language.
+    embed_df : pd.DataFrame
+        Word embeddings with columns as dimensions and words as index.
+
+    Returns
+    -------
+    embed_tensor : torch.Tensor
+        Word embeddings as Tensor.
+    """
+    
+    num_tokens = len(source_vocab)
+    embedding_dim = embed_df.shape[1]
+    weights = np.zeros((num_tokens,embedding_dim),dtype=np.float32)
+    
+    for idx in range(num_tokens):
+        token = source_vocab.lookup_index(idx)
+        if token in embed_df.index:
+            weights[idx,:] = embed_df.loc[token]
+        else:
+            weights[idx,:] = np.random.randn(1,embedding_dim)
+    
+    embed_tensor = torch.FloatTensor(weights)
+    return embed_tensor
+
+def eval_nmt_bleu(model,dataset,vectorizer,args):
+    """
+    Evaluates the trained model on the test set using the bleu_score method
+    from NLTK.
+
+    Parameters
+    ----------
+    model : NMTModel
+        Trained NMT model.
+    dataset : Dataset
+        Dataset with Source/Target sentences.
+    vectorizer : object
+        Vectorizes sentences.
+    args : Namespace
+        Simulation parameters.
+
+    Returns
+    -------
+    float
+        Average bleu-4 score.
+    bleu4 : TYPE
+        Array of sentence bleu-4 scores.
+    """
+    
+    model = model.eval().to(args.device)
+    
+    sampler = NMTSamplerWithMLTM(vectorizer, model)
+    
+    dataset.set_split('test')
+    batch_generator = generate_nmt_batches(dataset, 
+                                           batch_size=args.batch_size, 
+                                           device=args.device)
+    
+    test_results = []
+    for batch_dict in batch_generator:
+        sampler.apply_to_batch(batch_dict)
+        for i in range(args.batch_size):
+            test_results.append(sampler.get_ith_item(i, False))
+    
+    bleu4 = np.array([r['bleu-4'] for r in test_results])*100
+    return np.mean(bleu4),bleu4
+
 
 
